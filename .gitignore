@@ -27,3 +27,4 @@ Thumbs.db
 # Project specific
 *.docx
 
+/demo_one/node_modules/

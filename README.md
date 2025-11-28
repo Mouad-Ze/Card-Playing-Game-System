@@ -80,22 +80,6 @@ python run_node.py P3 8003 192.168.1.12
 
 The third argument is the machine's own IP address. The node will automatically bind to `0.0.0.0` (all interfaces) when a non-localhost IP is provided.
 
-#### Step 3: Firewall Configuration
-
-Ensure ports 8001, 8002, and 8003 are open on all machines:
-- **Linux**: `sudo ufw allow 8001:8003/tcp`
-- **Windows**: Configure Windows Firewall to allow these ports
-- **VM Network**: Ensure VMs can communicate (bridged/NAT network)
-
-### Using the Provided Test Machines
-
-If using the course-provided machines (svm-11.cs.helsinki.fi, svm-11-2.cs.helsinki.fi, svm-11-3.cs.helsinki.fi):
-
-1. SSH into each machine
-2. Clone/copy the code to each machine
-3. Update IP addresses in `run_node.py` with the actual machine IPs
-4. Run the appropriate node on each machine
-
 ## Game Rules & Flow
 
 Once all nodes are running, the game will automatically start. P1 initiates the first game. The rules follow the traditional 13-card Rami variant used in this project and are organized below for easy reference.
@@ -278,6 +262,4 @@ all_nodes = {
 - **Fault Tolerance (d)**: Heartbeats detect failed nodes, automatically mark them dead, and rotate the token past them so the game can continue. Logs capture events for debugging after failures.
 - **Scalability Discussion (e)**: Adding players requires moderate changes (e.g., expanding `all_player_ids`). The protocol already generalizes to more nodes; documentation notes how to extend to 4+ players and how network setup must evolve.
 - **Node Requirements**: Each node is a standalone process (can run on separate VMs) with its own IP, TCP server, and outbound sockets to the others. All important events are logged under `logs/`.
-
-For the full textual requirements and rationale (virtualization guidance, logging expectations, etc.), keep this README alongside your project report so reviewers can map the prototype to the assignment brief.
 
