@@ -263,9 +263,9 @@ class RamiGame:
 
     def draw_card(self, player_id: str, source: str) -> Card:
         if player_id != self.current_player_id:
-            raise RuntimeError("Not this player's turn.")
+            raise RuntimeError(f"Not this player's turn. Current: {self.current_player_id}, Requested: {player_id}")
         if self.phase != "AWAIT_DRAW":
-            raise RuntimeError("Player has already drawn.")
+            raise RuntimeError(f"Player has already drawn. Phase: {self.phase}")
         if source == "deck":
             if len(self.deck) == 0:
                 raise RuntimeError("Deck is empty.")
@@ -273,10 +273,12 @@ class RamiGame:
         elif source == "discard":
             if not self.discard_pile:
                 raise RuntimeError("Discard pile is empty.")
+            # Pop from the end (top of discard pile)
             card = self.discard_pile.pop()
         else:
             raise ValueError("source must be 'deck' or 'discard'.")
 
+        # Add card to player's hand
         self.players[player_id].draw(card)
         self.phase = "AWAIT_DISCARD_OR_WIN"
         return card

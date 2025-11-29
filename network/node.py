@@ -57,14 +57,16 @@ class RamiNode:
         self.current_action_id = 0
         self.pending_votes: Dict[int, Dict[str, bool]] = {}
         self.actions_by_id: Dict[int, dict] = {}
-        self.applied_action_ids = set()
+        # Use composite key (action_id, player_id) to track applied actions
+        # This prevents collisions when different players use the same action ID
+        self.applied_actions = set()  # Set of (action_id, player_id) tuples
 
         # Heartbeat tracking
         now = time.time()
         self.last_heartbeat = {pid: now for pid in self.all_player_ids}
         self.alive_players = set(self.all_player_ids)
         self.heartbeat_interval = 2
-        self.heartbeat_timeout = 6
+        self.heartbeat_timeout = 15  # Increased to 15 seconds to be more tolerant of network delays
 
         self.running = True
 
@@ -133,24 +135,34 @@ class RamiNode:
         print(f"[{self.player_id}] Starting NEW GAME.")
 
         dealer = random.choice(self.all_player_ids)
-        self.logger.info(f"Randomly selected dealer = {dealer}")
-        print(f"[{self.player_id}] Randomly selected dealer = {dealer}")
+        # Randomize seed for each new game
+        new_seed = random.randint(1, 1000000)
+        self.logger.info(f"Randomly selected dealer = {dealer}, seed = {new_seed}")
+        print(f"[{self.player_id}] Randomly selected dealer = {dealer}, seed = {new_seed}")
 
         self._broadcast({
             "type": DEALER_SELECTED,
             "sender": self.player_id,
-            "payload": {"dealer": dealer}
+            "payload": {"dealer": dealer, "seed": new_seed}
         })
 
         # Apply locally too
-        self._apply_dealer(dealer)
+        self._apply_dealer(dealer, new_seed)
 
         # Create the game using new turn order
         self._reset_game_state()
+        
+        # P1 (who initiates the game) should always broadcast the token holder
+        # to ensure all nodes receive it, regardless of who the dealer is
+        if self.token_holder:
+            self._broadcast_token_holder()
+            self.logger.info(f"Broadcasted initial token holder: {self.token_holder}")
 
-    def _apply_dealer(self, dealer):
+    def _apply_dealer(self, dealer, seed=None):
         """Apply the dealer to THIS node and derive turn order."""
         self.dealer = dealer
+        if seed is not None:
+            self.seed = seed
         idx = self.all_player_ids.index(dealer)
 
         # Turn order: dealer → next → next …
@@ -159,22 +171,31 @@ class RamiNode:
             for i in range(self.n_players)
         ]
 
-        # Dealer holds the initial token
+        # Dealer holds the initial token (first in turn order)
         self.token_holder = self.turn_order[0]
 
-        self.logger.info(f"New dealer = {dealer}, turn order = {self.turn_order}")
+        self.logger.info(f"New dealer = {dealer}, turn order = {self.turn_order}, seed = {self.seed}, token_holder = {self.token_holder}")
         print(f"[{self.player_id}] New dealer = {dealer}")
         print(f"[{self.player_id}] New turn order = {self.turn_order}")
+        print(f"[{self.player_id}] Initial token holder = {self.token_holder}")
 
-        # Broadcast token holder if needed
+        # Always broadcast token holder when dealer is applied
+        # The player who initiated the game (P1) should broadcast
+        # But also, if this node is the dealer, it should broadcast too
+        # To ensure all nodes get the token announcement, we'll broadcast from whoever receives DEALER_SELECTED
+        # Actually, let's have the dealer always broadcast the token
         if self.player_id == dealer:
             self._broadcast_token_holder()
+        # Sync game's current player after reset
+        self._sync_game_current_player()
 
     def _reset_game_state(self):
         """Start a fresh RamiGame replica using the new turn order."""
         self.logger.info("Resetting local game state")
         print(f"[{self.player_id}] Resetting local game state.")
         self.game = RamiGame(self.turn_order, seed=self.seed)
+        # Sync game's current player with token holder after reset
+        self._sync_game_current_player()
 
 
     def try_draw(self, source="deck"):
@@ -182,6 +203,17 @@ class RamiNode:
             self.logger.warning("Cannot draw: no token")
             print(f"[{self.player_id}] Cannot draw: no token.")
             return
+        
+        # Ensure game state is synced before proposing draw
+        if self.game:
+            if self.game.current_player_id != self.player_id:
+                self.logger.warning(f"Game current player ({self.game.current_player_id}) doesn't match token holder ({self.player_id}), syncing...")
+                self._sync_game_current_player(force=True)
+            if self.game.phase != "AWAIT_DRAW":
+                self.logger.warning(f"Game phase is {self.game.phase}, expected AWAIT_DRAW. Current player: {self.game.current_player_id}, Token holder: {self.token_holder}")
+                # Try to sync
+                self._sync_game_current_player(force=True)
+        
         aid = self._next_action_id()
         action = {
             "action_id": aid,
@@ -189,7 +221,7 @@ class RamiNode:
             "player": self.player_id,
             "source": source,
         }
-        self.logger.info(f"Proposing DRAW action {aid} from {source}")
+        self.logger.info(f"Proposing DRAW action {aid} from {source} (game current: {self.game.current_player_id if self.game else 'None'}, phase: {self.game.phase if self.game else 'None'})")
         self._propose_action(action)
 
     def try_discard(self, card_str: str):
@@ -288,20 +320,50 @@ class RamiNode:
         sender = msg["sender"]
         payload = msg["payload"]
 
-        if mtype == HEARTBEAT:
+        # Update heartbeat timestamp for ANY message from a peer
+        # This ensures we know the node is alive if it's sending any messages
+        if sender in self.all_player_ids and sender != self.player_id:
             self.last_heartbeat[sender] = time.time()
+            # If the node was previously marked as dead, mark it as alive again
+            if sender not in self.alive_players:
+                self.logger.info(f"Node {sender} is alive again (received message)")
+                self.alive_players.add(sender)
+
+        if mtype == HEARTBEAT:
+            # Heartbeat messages are handled above (updating last_heartbeat)
             return
 
         if mtype == DEALER_SELECTED:
             dealer = payload["dealer"]
-            self._apply_dealer(dealer)
+            seed = payload.get("seed", random.randint(1, 1000000))
+            self._apply_dealer(dealer, seed)
             self._reset_game_state()
+            # If this node is the dealer, also broadcast token to ensure all nodes get it
+            # (P1 already broadcast, but this provides redundancy)
+            if self.player_id == dealer and self.token_holder:
+                self._broadcast_token_holder()
             return
 
         if mtype == TOKEN_ANNOUNCE:
-            self.token_holder = payload["token_holder"]
-            self.logger.info(f"Token holder changed to: {self.token_holder}")
-            print(f"[{self.player_id}] Token holder now: {self.token_holder}")
+            new_token_holder = payload["token_holder"]
+            old_token_holder = self.token_holder
+            sender = msg.get("sender", "unknown")
+            
+            # Always accept token announcements - they represent the authoritative state
+            # Log the change for debugging
+            if new_token_holder != old_token_holder:
+                self.logger.info(f"Token holder changed to: {new_token_holder} (was: {old_token_holder}, from: {sender})")
+                print(f"[{self.player_id}] Token holder now: {new_token_holder} (from {sender})")
+            else:
+                self.logger.debug(f"Token holder unchanged: {new_token_holder} (from {sender})")
+            
+            # Always update token holder to match the announcement (authoritative source)
+            self.token_holder = new_token_holder
+            
+            # Force sync game's current player with token holder
+            # This ensures the game state matches the token holder
+            # Important: sync after setting token_holder so sync can use the new value
+            self._sync_game_current_player(force=True)
             return
 
         if mtype == ACTION_PROPOSE:
@@ -356,7 +418,9 @@ class RamiNode:
             for pid in self.all_player_ids:
                 if pid == self.player_id:
                     continue
-                if now - self.last_heartbeat[pid] > self.heartbeat_timeout:
+                time_since_last = now - self.last_heartbeat[pid]
+                if time_since_last > self.heartbeat_timeout:
+                    self.logger.warning(f"Node {pid} heartbeat timeout: {time_since_last:.1f}s since last message (timeout: {self.heartbeat_timeout}s)")
                     self._mark_player_dead(pid, reason="heartbeat timeout")
             time.sleep(self.heartbeat_interval)
 
@@ -365,25 +429,43 @@ class RamiNode:
         return self.token_holder == self.player_id
 
     def _rotate_token(self):
+        """Rotate token to next player in turn order. Only call this when you have the token."""
         if not self.turn_order:
             return
 
-        current = self.token_holder
-        if current in self.turn_order:
-            idx = self.turn_order.index(current)
+        # Use game's turn order if available to ensure consistency
+        if self.game and hasattr(self.game, 'turn_order') and self.game.turn_order:
+            turn_order = self.game.turn_order
         else:
-            idx = -1
+            turn_order = self.turn_order
 
+        current = self.token_holder
+        if current not in turn_order:
+            self.logger.error(f"Current token holder {current} not in turn order {turn_order}")
+            return
+
+        idx = turn_order.index(current)
+        # Find next alive player in turn order
         new_holder = None
-        for _ in range(self.n_players):
-            idx = (idx + 1) % self.n_players
-            candidate = self.turn_order[idx]
+        for _ in range(len(turn_order)):
+            idx = (idx + 1) % len(turn_order)
+            candidate = turn_order[idx]
             if candidate in self.alive_players:
                 new_holder = candidate
                 break
 
-        self.token_holder = new_holder
-        self._broadcast_token_holder()
+        if new_holder is None:
+            # Fallback: use first alive player
+            for candidate in turn_order:
+                if candidate in self.alive_players:
+                    new_holder = candidate
+                    break
+
+        if new_holder:
+            self.token_holder = new_holder
+            self._broadcast_token_holder()
+            # Sync game's current player with token holder
+            self._sync_game_current_player()
 
     def _broadcast_token_holder(self):
         self._broadcast({
@@ -393,6 +475,62 @@ class RamiNode:
         })
         self.logger.info(f"Token rotated to: {self.token_holder}")
         print(f"[{self.player_id}] Broadcast token holder = {self.token_holder}")
+
+    def _sync_game_current_player(self, force=False):
+        """Sync the game's current player index with the token holder.
+        Only sync if the game's current player doesn't match the token holder.
+        Don't override if game is in a specific phase (like AWAIT_DISCARD_OR_WIN).
+        
+        Args:
+            force: If True, force sync even if current player matches (used when receiving TOKEN_ANNOUNCE)
+        """
+        if self.game is None or self.token_holder is None:
+            return
+        if self.token_holder not in self.game.turn_order:
+            return
+        
+        # Find the index of the token holder in the game's turn order
+        target_idx = self.game.turn_order.index(self.token_holder)
+        current_idx = self.game.current_player_index
+        
+        # If game's current player already matches token holder and phase is correct, no need to sync
+        if not force and current_idx == target_idx and self.game.phase == "AWAIT_DRAW":
+            return
+        
+        # When forcing (e.g., receiving TOKEN_ANNOUNCE), sync if needed
+        # This ensures the game state matches the token holder
+        # BUT: Don't override AWAIT_DISCARD_OR_WIN phase - player is mid-turn
+        if force:
+            old_idx = self.game.current_player_index
+            old_phase = self.game.phase
+            # Only update if the index actually needs to change
+            if old_idx != target_idx:
+                self.game.current_player_index = target_idx
+                # Only set phase to AWAIT_DRAW if we're not in a mid-turn phase
+                # Don't override AWAIT_DISCARD_OR_WIN - player has drawn and needs to discard
+                if old_phase not in ("AWAIT_DISCARD_OR_WIN", "WIN_DECLARED", "GAME_OVER"):
+                    self.game.phase = "AWAIT_DRAW"
+                    self.logger.info(f"Force synced game: current player {old_idx}->{target_idx} ({self.game.current_player_id}), phase {old_phase}->AWAIT_DRAW")
+                else:
+                    self.logger.info(f"Force synced game: current player {old_idx}->{target_idx} ({self.game.current_player_id}), phase unchanged ({old_phase})")
+            elif old_phase != "AWAIT_DRAW" and old_phase not in ("AWAIT_DISCARD_OR_WIN", "WIN_DECLARED", "GAME_OVER"):
+                # Index is correct but phase is wrong, just fix the phase (but not if mid-turn)
+                self.game.phase = "AWAIT_DRAW"
+                self.logger.info(f"Force synced game phase: {old_phase}->AWAIT_DRAW (current player already correct: {self.game.current_player_id})")
+            # If both index and phase are correct, or we're in a mid-turn phase, no need to do anything
+        elif self.game.phase == "AWAIT_DRAW":
+            # Normal sync when already in AWAIT_DRAW phase
+            old_idx = self.game.current_player_index
+            self.game.current_player_index = target_idx
+            self.logger.info(f"Synced game current player to {self.token_holder} (index {old_idx} -> {target_idx})")
+        elif self.game.phase == "INIT":
+            # During initialization, sync and set phase
+            self.game.current_player_index = target_idx
+            self.game.phase = "AWAIT_DRAW"
+            self.logger.info(f"Synced game current player to {self.token_holder} (index {target_idx}) during INIT")
+        else:
+            # Game is in mid-turn phase, log but don't sync
+            self.logger.warning(f"Cannot sync: game phase is {self.game.phase}, current player is {self.game.current_player_id}, token holder is {self.token_holder}")
 
     def _mark_player_dead(self, pid, reason=""):
         if pid not in self.alive_players:
@@ -423,6 +561,15 @@ class RamiNode:
     def _on_action_propose(self, action):
         aid = action["action_id"]
         self.actions_by_id[aid] = action
+        # Before validating, ensure game state is synced if this is our action
+        # This helps when we just received the token
+        # BUT: Don't sync for DISCARD actions - player is in AWAIT_DISCARD_OR_WIN phase
+        if action.get("player") == self.player_id and self.token_holder == self.player_id:
+            action_kind = action.get("kind")
+            if action_kind != "DISCARD" and self.game:
+                if self.game.current_player_id != self.player_id or self.game.phase != "AWAIT_DRAW":
+                    self.logger.info(f"Syncing game state before voting on own {action_kind} action")
+                    self._sync_game_current_player(force=True)
         vote = self._validate_action(action)
 
         if aid not in self.pending_votes:
@@ -466,8 +613,22 @@ class RamiNode:
             # DECLARE_WIN ends the game, so no token rotation needed
             if self.game and self.game.phase != "GAME_OVER":
                 if action['kind'] == 'DISCARD':
-                    # After discard, rotate token to next player
-                    self._rotate_token()
+                    # After discard, the game's next_player() was called in discard_card()
+                    # Set token holder to match the game's new current player
+                    # This ensures sequential order based on game's turn order
+                    new_token_holder = self.game.current_player_id
+                    if new_token_holder and new_token_holder in self.alive_players:
+                        # Always update and broadcast, even if it's the same
+                        # This ensures all nodes have the same view
+                        old_token_holder = self.token_holder
+                        self.token_holder = new_token_holder
+                        self._broadcast_token_holder()
+                        if new_token_holder != old_token_holder:
+                            self.logger.info(f"Token passed to next player: {old_token_holder} -> {new_token_holder} (after DISCARD by {action['player']}, game current_player_index={self.game.current_player_index})")
+                        else:
+                            self.logger.warning(f"Token holder unchanged after DISCARD: {new_token_holder} (this should not happen)")
+                    else:
+                        self.logger.error(f"Cannot set token to {new_token_holder} - not in alive players or invalid. Alive players: {self.alive_players}, game current_player_id: {self.game.current_player_id}")
                 # For DRAW actions, don't rotate - player keeps token to discard
         else:
             self.logger.warning(f"ABORTED action {aid}: insufficient votes ({yes}/{len(self.alive_players)})")
@@ -481,7 +642,26 @@ class RamiNode:
 
     def _on_action_commit(self, payload):
         action = payload["action"]
+        # Sync game state before applying action to ensure we have the correct state
+        # This is especially important for DRAW actions from discard pile
+        if action.get('kind') == 'DRAW' and self.token_holder:
+            # Before applying a DRAW action, ensure our game state matches the token holder
+            if self.game and self.game.current_player_id != self.token_holder:
+                self.logger.info(f"[{self.player_id}] Syncing game state before DRAW: current={self.game.current_player_id}, token={self.token_holder}")
+                self._sync_game_current_player(force=True)
+        # Only apply the action, don't rotate token here
+        # Token rotation should only happen in _on_action_vote by the token holder
         self._apply_action(action)
+        # After applying a DISCARD action, sync game state if we received the token
+        # This ensures the game's current player matches the token holder
+        # Note: We sync regardless of whether we have the token, because the token might
+        # have been passed to us and we need to ensure our game state is correct
+        if action.get('kind') == 'DISCARD' and self.token_holder:
+            # The discard action called next_player(), so the game's current player should
+            # match the token holder. If not, sync it.
+            if self.game and self.game.current_player_id != self.token_holder:
+                self.logger.info(f"Syncing game state after DISCARD: current={self.game.current_player_id}, token={self.token_holder}")
+                self._sync_game_current_player(force=True)
 
 
     def _validate_action(self, action):
@@ -492,25 +672,70 @@ class RamiNode:
         kind = action["kind"]
         player = action["player"]
 
+        # Before validating, ensure game state is synced with token holder
+        # This is critical when the token was just passed to this player
+        # BUT: Don't sync phase for DISCARD actions - player is in AWAIT_DISCARD_OR_WIN phase
+        if self.token_holder and kind != "DISCARD":
+            needs_sync = False
+            if self.token_holder == player and (g.current_player_id != player or g.phase != "AWAIT_DRAW"):
+                needs_sync = True
+            elif self.token_holder == self.player_id and player == self.player_id and (g.current_player_id != self.player_id or g.phase != "AWAIT_DRAW"):
+                needs_sync = True
+            
+            if needs_sync:
+                self.logger.info(f"Syncing game state before validation: current={g.current_player_id}, token={self.token_holder}, phase={g.phase}, action_player={player}")
+                self._sync_game_current_player(force=True)
+        elif self.token_holder and kind == "DISCARD":
+            # For DISCARD actions, only sync current player index if needed, NOT the phase
+            # The player is in AWAIT_DISCARD_OR_WIN phase and should stay there
+            if g.current_player_id != player:
+                self.logger.info(f"Syncing current player before DISCARD validation: current={g.current_player_id}, token={self.token_holder}, action_player={player}, phase={g.phase}")
+                # Only sync the player index, not the phase
+                if self.token_holder in g.turn_order:
+                    target_idx = g.turn_order.index(self.token_holder)
+                    if g.current_player_index != target_idx:
+                        old_phase = g.phase  # Preserve phase
+                        g.current_player_index = target_idx
+                        # Ensure phase is preserved
+                        if g.phase != old_phase:
+                            g.phase = old_phase
+                            self.logger.warning(f"Phase was changed during sync, restored to {old_phase}")
+                        self.logger.info(f"Synced current player index to {target_idx} ({g.current_player_id}) for DISCARD validation, phase preserved: {g.phase}")
+            # Log if phase is wrong for debugging
+            if g.phase != "AWAIT_DISCARD_OR_WIN" and g.phase != "WIN_DECLARED":
+                self.logger.warning(f"DISCARD validation: phase is {g.phase}, expected AWAIT_DISCARD_OR_WIN or WIN_DECLARED")
+
         if g.current_player_id != player:
+            self.logger.warning(f"Validation failed: current player is {g.current_player_id}, action player is {player}")
             return False
 
         if kind == "DRAW":
             if g.phase != "AWAIT_DRAW":
+                self.logger.warning(f"Validation failed: phase is {g.phase}, expected AWAIT_DRAW")
                 return False
             src = action["source"]
-            state = g.game_state_summary()
-            if src == "deck" and state["deck_size"] == 0:
-                return False
-            if src == "discard" and state["discard_top"] is None:
-                return False
+            if src == "deck":
+                if len(g.deck) == 0:
+                    self.logger.warning(f"Validation failed: deck is empty")
+                    return False
+            elif src == "discard":
+                # Check discard pile directly, not through game_state_summary
+                # This is more reliable as it checks the actual state
+                if not g.discard_pile or len(g.discard_pile) == 0:
+                    self.logger.warning(f"Validation failed: discard pile is empty (size: {len(g.discard_pile)})")
+                    return False
             return True
 
         if kind == "DISCARD":
+            # Check phase - must be AWAIT_DISCARD_OR_WIN or WIN_DECLARED
             if g.phase not in ("AWAIT_DISCARD_OR_WIN", "WIN_DECLARED"):
+                self.logger.warning(f"DISCARD validation failed: phase is {g.phase}, expected AWAIT_DISCARD_OR_WIN or WIN_DECLARED")
                 return False
             card = str_to_card(action["card"])
-            return card in g.players[player].hand
+            if card not in g.players[player].hand:
+                self.logger.warning(f"DISCARD validation failed: card {card} not in {player}'s hand")
+                return False
+            return True
 
         if kind == "DECLARE_WIN":
             if g.phase != "AWAIT_DISCARD_OR_WIN":
@@ -530,36 +755,202 @@ class RamiNode:
 
     def _apply_action(self, action):
         if self.game is None:
+            self.logger.warning(f"Cannot apply action {action.get('action_id')}: game is None")
             return
 
         g = self.game
         kind = action["kind"]
         action_id = action.get("action_id")
+        player = action["player"]  # Extract player first, before using it in action_key
 
         if action_id is not None:
-            if action_id in self.applied_action_ids:
+            # Use composite key (action_id, player_id) to check if action was already applied
+            action_key = (action_id, player)
+            if action_key in self.applied_actions:
+                self.logger.info(f"[{self.player_id}] Action {action_id} by {player} already applied, skipping")
                 return
-            self.applied_action_ids.add(action_id)
-
-        player = action["player"]
+            self.logger.info(f"[{self.player_id}] Applying action {action_id}: {kind} by {player}")
 
         if kind == "DRAW":
             src = action["source"]
             try:
+                # Log hand size and discard pile state before draw
+                hand_size_before = len(g.players[player].hand)
+                discard_size_before = len(g.discard_pile) if src == "discard" else 0
+                discard_top_before = str(g.discard_pile[-1]) if (src == "discard" and g.discard_pile) else None
+                
+                # Log game state before draw for debugging
+                self.logger.info(f"[{self.player_id}] Before DRAW: player={player}, current_player={g.current_player_id}, phase={g.phase}, hand_size={hand_size_before}, discard_size={discard_size_before}, discard_top={discard_top_before}")
+                print(f"[{self.player_id}] Before DRAW from {src}: hand_size={hand_size_before}, discard_size={discard_size_before}, discard_top={discard_top_before}")
+                
+                # Before calling draw_card, ensure the game state is correct
+                # If the current player doesn't match, sync it
+                if g.current_player_id != player:
+                    self.logger.warning(f"[{self.player_id}] Current player mismatch before draw: game.current={g.current_player_id}, action.player={player}. Syncing...")
+                    self._sync_game_current_player(force=True)
+                    # After sync, check again
+                    if g.current_player_id != player:
+                        self.logger.error(f"[{self.player_id}] Still mismatched after sync: game.current={g.current_player_id}, action.player={player}")
+                        raise RuntimeError(f"Cannot apply DRAW: current player mismatch after sync")
+                
+                # Ensure phase is correct
+                if g.phase != "AWAIT_DRAW":
+                    self.logger.warning(f"[{self.player_id}] Phase mismatch before draw: phase={g.phase}, expected AWAIT_DRAW. Syncing...")
+                    self._sync_game_current_player(force=True)
+                    # After sync, check again
+                    if g.phase != "AWAIT_DRAW":
+                        self.logger.error(f"[{self.player_id}] Still wrong phase after sync: phase={g.phase}")
+                        raise RuntimeError(f"Cannot apply DRAW: phase mismatch after sync")
+                
+                # Check if discard pile is empty before attempting draw
+                if src == "discard":
+                    if not g.discard_pile or len(g.discard_pile) == 0:
+                        self.logger.error(f"[{self.player_id}] Cannot draw from discard: discard pile is empty! Discard pile size: {len(g.discard_pile)}")
+                        print(f"[{self.player_id}] ERROR: Cannot draw from discard - discard pile is empty!")
+                        raise RuntimeError(f"Cannot apply DRAW: discard pile is empty on this node")
+                    # Log what card we're about to draw
+                    top_card = g.discard_pile[-1]
+                    self.logger.info(f"[{self.player_id}] About to draw from discard pile: top card is {top_card}, pile size is {len(g.discard_pile)}")
+                    print(f"[{self.player_id}] About to draw {top_card} from discard pile (size: {len(g.discard_pile)})")
+                
+                # Before calling draw_card, ensure the game state is correct
+                # If the current player doesn't match, sync it
+                if g.current_player_id != player:
+                    self.logger.warning(f"[{self.player_id}] Current player mismatch before draw: game.current={g.current_player_id}, action.player={player}. Syncing...")
+                    self._sync_game_current_player(force=True)
+                    # After sync, check again
+                    if g.current_player_id != player:
+                        self.logger.error(f"[{self.player_id}] Still mismatched after sync: game.current={g.current_player_id}, action.player={player}")
+                        raise RuntimeError(f"Cannot apply DRAW: current player mismatch after sync")
+                
+                # Ensure phase is correct
+                if g.phase != "AWAIT_DRAW":
+                    self.logger.warning(f"[{self.player_id}] Phase mismatch before draw: phase={g.phase}, expected AWAIT_DRAW. Syncing...")
+                    self._sync_game_current_player(force=True)
+                    # After sync, check again
+                    if g.phase != "AWAIT_DRAW":
+                        self.logger.error(f"[{self.player_id}] Still wrong phase after sync: phase={g.phase}")
+                        raise RuntimeError(f"Cannot apply DRAW: phase mismatch after sync")
+                
+                # For discard draws, ensure discard pile is not empty
+                if src == "discard":
+                    if not g.discard_pile or len(g.discard_pile) == 0:
+                        self.logger.error(f"[{self.player_id}] Discard pile is empty on this node! This is a sync issue - action was proposed, so discard pile should exist.")
+                        raise RuntimeError(f"Cannot apply DRAW from discard: discard pile is empty on this node")
+                
+                # Call draw_card - this should pop from discard pile and add to hand
+                self.logger.info(f"[{self.player_id}] Calling g.draw_card({player}, {src})")
                 card = g.draw_card(player, src)
-                self.logger.info(f"Applied DRAW: {player} drew from {src} -> {card}")
+                self.logger.info(f"[{self.player_id}] draw_card returned: {card}")
+                
+                hand_size_after = len(g.players[player].hand)
+                discard_size_after = len(g.discard_pile) if src == "discard" else 0
+                
+                self.logger.info(f"[{self.player_id}] Applied DRAW: {player} drew from {src} -> {card} (hand: {hand_size_before} -> {hand_size_after}, discard: {discard_size_before} -> {discard_size_after})")
+                print(f"[{self.player_id}] Applied DRAW: {player} drew {card} from {src} (hand: {hand_size_before} -> {hand_size_after}, discard: {discard_size_before} -> {discard_size_after})")
+                
+                # For discard draws, verify the card was actually removed from discard pile
+                if src == "discard":
+                    if discard_size_after != discard_size_before - 1:
+                        self.logger.error(f"[{self.player_id}] CRITICAL: Discard pile size mismatch! Before: {discard_size_before}, After: {discard_size_after}, Expected: {discard_size_before - 1}")
+                        print(f"[{self.player_id}] CRITICAL ERROR: Discard pile size did not decrease! Before: {discard_size_before}, After: {discard_size_after}")
+                    if card in g.discard_pile:
+                        self.logger.error(f"[{self.player_id}] CRITICAL: Card {card} is still in discard pile after drawing!")
+                        print(f"[{self.player_id}] CRITICAL ERROR: Card {card} is still in discard pile!")
+                    else:
+                        self.logger.info(f"[{self.player_id}] Verified: Card {card} was removed from discard pile")
+                
+                if hand_size_after != hand_size_before + 1:
+                    self.logger.error(f"ERROR: Hand size did not increase correctly after draw! Expected {hand_size_before + 1}, got {hand_size_after}")
+                    print(f"[{self.player_id}] ERROR: Hand size did not increase correctly after draw!")
+                
+                if src == "discard" and discard_size_after != discard_size_before - 1:
+                    self.logger.error(f"ERROR: Discard pile size did not decrease correctly! Expected {discard_size_before - 1}, got {discard_size_after}")
+                    print(f"[{self.player_id}] ERROR: Discard pile size did not decrease correctly!")
+                
+                # Verify card is in hand
+                if card not in g.players[player].hand:
+                    self.logger.error(f"ERROR: Card {card} not found in {player}'s hand after draw from {src}!")
+                    print(f"[{self.player_id}] ERROR: Card {card} not found in {player}'s hand after draw!")
+                    # Try to add it manually as a fallback
+                    g.players[player].draw(card)
+                    self.logger.warning(f"Manually added card {card} to {player}'s hand as fallback")
+                    # Verify it's now in hand
+                    if card in g.players[player].hand:
+                        self.logger.info(f"Successfully added card {card} to hand via fallback")
+                        print(f"[{self.player_id}] Successfully added card {card} to hand via fallback")
+                else:
+                    self.logger.info(f"[{self.player_id}] Verified: Card {card} is in {player}'s hand after draw from {src}")
+                
+                # Mark action as applied only after successful completion
+                if action_id is not None:
+                    action_key = (action_id, player)
+                    self.applied_actions.add(action_key)
+                    self.logger.info(f"[{self.player_id}] Successfully applied action {action_id} by {player}")
+                    
             except Exception as e:
-                self.logger.error(f"DRAW apply error: {e}")
-                print(f"[{self.player_id}] DRAW apply error:", e)
+                # Don't mark as applied if it failed
+                self.logger.error(f"[{self.player_id}] Failed to apply action {action_id}: {e}")
+                self.logger.error(f"[{self.player_id}] DRAW apply error: {e}", exc_info=True)
+                print(f"[{self.player_id}] DRAW apply error: {e}")
+                # Log game state for debugging
+                if self.game:
+                    discard_info = f"discard_pile_size={len(self.game.discard_pile)}"
+                    if self.game.discard_pile:
+                        discard_info += f", discard_top={self.game.discard_pile[-1]}"
+                    self.logger.error(f"[{self.player_id}] Game state: current_player={self.game.current_player_id}, phase={self.game.phase}, {discard_info}")
+                    print(f"[{self.player_id}] Game state: current_player={self.game.current_player_id}, phase={self.game.phase}, {discard_info}")
+                # If it's a discard draw and the error is about empty pile, check if it's a sync issue
+                if src == "discard" and "empty" in str(e).lower():
+                    self.logger.error(f"[{self.player_id}] Discard pile appears empty on this node. This might be a synchronization issue.")
+                    print(f"[{self.player_id}] WARNING: Discard pile appears empty - possible sync issue between nodes")
 
         elif kind == "DISCARD":
             card = str_to_card(action["card"])
             try:
+                # Log discard pile state before discard
+                discard_size_before = len(g.discard_pile)
+                discard_top_before = str(g.discard_pile[-1]) if g.discard_pile else None
+                hand_size_before = len(g.players[player].hand)
+                
                 g.discard_card(player, card)
-                self.logger.info(f"Applied DISCARD: {player} discarded {card}")
+                
+                # Log discard pile state after discard
+                discard_size_after = len(g.discard_pile)
+                discard_top_after = str(g.discard_pile[-1]) if g.discard_pile else None
+                hand_size_after = len(g.players[player].hand)
+                
+                self.logger.info(f"Applied DISCARD: {player} discarded {card} (hand: {hand_size_before} -> {hand_size_after}, discard: {discard_size_before} -> {discard_size_after}, top: {discard_top_before} -> {discard_top_after})")
+                print(f"[{self.player_id}] Applied DISCARD: {player} discarded {card} (discard pile: {discard_size_before} -> {discard_size_after} cards)")
+                
+                # Verify card is in discard pile
+                if card not in g.discard_pile:
+                    self.logger.error(f"ERROR: Card {card} not found in discard pile after discard!")
+                    print(f"[{self.player_id}] ERROR: Card {card} not found in discard pile after discard!")
+                else:
+                    self.logger.info(f"Verified: Card {card} is in discard pile (position: {g.discard_pile.index(card) if card in g.discard_pile else 'not found'})")
+                    
+                # Verify discard pile size increased
+                if discard_size_after != discard_size_before + 1:
+                    self.logger.error(f"ERROR: Discard pile size did not increase correctly! Expected {discard_size_before + 1}, got {discard_size_after}")
+                    print(f"[{self.player_id}] ERROR: Discard pile size did not increase correctly!")
+                
+                # Mark action as applied only after successful completion
+                if action_id is not None:
+                    action_key = (action_id, player)
+                    self.applied_actions.add(action_key)
+                    self.logger.info(f"[{self.player_id}] Successfully applied DISCARD action {action_id} by {player}")
+                    
             except Exception as e:
-                self.logger.error(f"DISCARD apply error: {e}")
-                print(f"[{self.player_id}] DISCARD apply error:", e)
+                # Don't mark as applied if it failed
+                if action_id is not None:
+                    self.logger.error(f"[{self.player_id}] Failed to apply DISCARD action {action_id} by {player}: {e}")
+                self.logger.error(f"DISCARD apply error: {e}", exc_info=True)
+                print(f"[{self.player_id}] DISCARD apply error: {e}")
+                # Log game state for debugging
+                if self.game:
+                    self.logger.error(f"Game state: current_player={self.game.current_player_id}, phase={self.game.phase}, discard_pile_size={len(self.game.discard_pile)}")
+                    print(f"[{self.player_id}] Game state: current_player={self.game.current_player_id}, phase={self.game.phase}, discard_pile_size={len(self.game.discard_pile)}")
 
         elif kind == "DECLARE_WIN":
             groups_str = action.get("groups", [])
